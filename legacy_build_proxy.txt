@@ -1,0 +1,289 @@
+"""HLODBuilder: Houdini 22 native reduction, UV layout and high-to-low PBR baking."""
+import json
+import math
+import sys
+import time
+import subprocess
+import hashlib
+from pathlib import Path
+import hou
+
+
+def write_json(path, value):
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(value, allow_nan=False), encoding='utf-8')
+    temporary.replace(path)
+
+
+def vector(v, keys):
+    values = tuple(float(v[k]) for k in keys)
+    if not all(math.isfinite(x) for x in values):
+        raise ValueError('Non-finite mesh attribute')
+    return values
+
+
+def node(parent, kind, name, source=None, parms=None):
+    n = parent.createNode(kind, name, exact_type_name=True)
+    if source is not None:
+        n.setInput(0, source)
+    if parms:
+        n.setParms(parms)
+    return n
+
+
+def checked(n):
+    n.cook(force=True)
+    if n.errors():
+        raise RuntimeError('%s: %s' % (n.path(), n.errors()))
+    return n.geometry()
+
+
+def input_geometry(part, name, material=None):
+    geo = hou.Geometry()
+    points = {}
+    # Unity exports the whole vertex buffer per submesh; omit unreferenced vertices.
+    for index in sorted(set(part['triangles'])):
+        if not 0 <= index < len(part['positions']):
+            raise ValueError('Triangle index out of range')
+        pos = part['positions'][index]
+        point = geo.createPoint()
+        point.setPosition(vector(pos, 'xyz'))
+        points[index] = point
+    uv = geo.addAttrib(hou.attribType.Vertex, 'uv', (0.0, 0.0, 0.0))
+    normal = geo.addAttrib(hou.attribType.Vertex, 'N', (0.0, 1.0, 0.0))
+    name_attr = geo.addAttrib(hou.attribType.Prim, 'name', '')
+    indices = part['triangles']
+    if not indices or len(indices) % 3:
+        raise ValueError('Expected nonempty triangle indices')
+    for start in range(0, len(indices), 3):
+        poly = geo.createPolygon()
+        poly.setAttribValue(name_attr, name)
+        for i in indices[start:start + 3]:
+            if i not in points:
+                raise ValueError('Triangle index out of range')
+            vertex = poly.addVertex(points[i])
+            u, v = vector(part['uv'][i], 'xy')
+            if material:
+                u = u * material['scale']['x'] + material['offset']['x']
+                v = v * material['scale']['y'] + material['offset']['y']
+            vertex.setAttribValue(uv, (u, v, 0.0))
+            vertex.setAttribValue(normal, vector(part['normals'][i], 'xyz'))
+    return geo
+
+
+def export_geometry(n, material):
+    result = {'material': material, 'unit': 0, 'positions': [], 'normals': [], 'uv': [], 'triangles': []}
+    geometry = checked(n)
+    for prim in geometry.prims():
+        if len(prim.vertices()) != 3:
+            raise ValueError('Non-triangle output from %s' % n.path())
+        for vertex in prim.vertices():
+            result['triangles'].append(len(result['positions']))
+            result['positions'].append(dict(zip('xyz', vertex.point().position())))
+            result['normals'].append(dict(zip('xyz', vertex.attribValue('N'))))
+            result['uv'].append(dict(zip('xy', vertex.attribValue('uv')[:2])))
+    if not result['triangles']:
+        raise ValueError('Empty reduced geometry')
+    return result
+
+
+def reduce_part(parent, source, percentage, name):
+    reduced = node(parent, 'polyreduce::2.0', name + '_reduce', source,
+                   {'percentage': percentage, 'preservequads': 0})
+    return node(parent, 'divide', name + '_triangles', reduced,
+                {'convex': 1, 'usemaxsides': 1, 'numsides': 3})
+
+
+def bake(parent, low, high, prefix, resolution, basic=True, suffix='diffuse', extension='png', gamma=2.2):
+    baker = node(parent, 'labs::maps_baker::5.0', 'bake_' + suffix)
+    baker.setInput(0, low)
+    baker.setInput(1, high)
+    # All channels explicitly assigned: Labs defaults must not silently add maps.
+    for name in ('bDiffuse', 'bNormal', 'bOpacity', 'bRoughness', 'bMetallic', 'bVertexCd',
+                 'bAO', 'bThickness', 'bCurvature', 'bWorldNormal', 'bHeight', 'bAlpha', 'bPos', 'usematerialid'):
+        baker.parm(name).set(int(name == 'bDiffuse' or (basic and name in ('bNormal', 'bOpacity', 'bRoughness', 'bMetallic'))))
+    baker.setParms({'sOutputFile': str(prefix) + '$(CHANNEL).' + extension,
+                    'sDiffuse': suffix, 'fDiffuseGamma': gamma, 'fNormalGamma': 1,
+                    'fRoughnessGamma': 1, 'fMetallicGamma': 1, 'edgepadding': 8,
+                    'bakename': 1, 'opacitytracing': 0, 'mBakeMode': 0,
+                    'fMaxTraceDist': max(1.0, checked(high).boundingBox().sizevec().length()),
+                    'exportlow': 0, 'exporthigh': 0})
+    baker.parmTuple('i2Resolution').set((resolution, resolution))
+    baker.parm('execute').pressButton()
+    if baker.errors():
+        raise RuntimeError(str(baker.errors()))
+    names = ['diffuse', 'normal', 'opacity', 'roughness', 'metallic'] if basic else [suffix]
+    for channel in names:
+        output = Path(str(prefix) + channel + '.' + extension)
+        if not output.is_file() or output.stat().st_size == 0:
+            raise RuntimeError('Baker did not write %s' % output)
+    return baker
+
+
+def build(job_path):
+    started = time.time()
+    folder = Path(job_path).resolve().parent
+    job = json.loads(Path(job_path).read_text(encoding='utf-8-sig'))
+    if job['version'] not in (1, 2) or not 1 <= job['percentage'] <= 100 or not job['parts']:
+        raise ValueError('Invalid job version, percentage or empty input')
+    full = job.get('mode') == 'hlod'
+    resolution = job.get('resolution', 512)
+    minimum_resolution = job.get('minimumAtlasResolution') or resolution
+    if minimum_resolution not in (64,128,256,512,1024,2048,4096) or minimum_resolution > resolution:
+        raise ValueError('Minimum atlas size must not exceed bake size')
+    uv_timeout = job.get('uvTimeoutSeconds') or 120
+    max_pages = job.get('maxAtlasPagesPerBucket') or 4
+    if not 1 <= max_pages <= 8:
+        raise ValueError('Atlas page budget must be between 1 and 8')
+    if not 5 <= uv_timeout <= 600:
+        raise ValueError('UV timeout must be between 5 and 600 seconds')
+    worker = Path(__file__).resolve().with_name('uv_worker.py')
+    fingerprint = hashlib.sha256(Path(job_path).read_bytes()+Path(__file__).read_bytes()+(worker.read_bytes() if full else b'')).hexdigest()
+    if full and (resolution not in (64, 128, 256, 512, 1024, 2048, 4096) or not job.get('chunks') or not job.get('materials')):
+        raise ValueError('Invalid full-HLOD inputs')
+    output = {'version': job['version'], 'mode': job.get('mode', 'simplify'), 'parts': [], 'chunks': [],
+              'inputTriangles': sum(len(p['triangles']) // 3 for p in job['parts']), 'outputTriangles': 0, 'qualityWarnings': 0}
+    def progress(phase, completed, total, chunk_id='', done_steps=0, total_steps=0):
+        write_json(folder / 'progress.json', {'phase': phase, 'completed': completed, 'total': total,
+                   'chunkId': chunk_id, 'doneSteps': done_steps, 'totalSteps': total_steps,
+                   'stepStarted': time.time(), 'state': 'complete' if phase == 'complete' else 'running'})
+        print(phase, completed, '/', total, flush=True)
+    container = hou.node('/obj').createNode('geo', 'HLODBuilder')
+    sources = []
+    for index, part in enumerate(job['parts']):
+        progress('输入几何 %d/%d' % (index + 1, len(job['parts'])), 0, len(job.get('chunks') or sources) or 1)
+        material = job['materials'][part['material']] if full else None
+        source_path = folder / ('source_%d.bgeo.sc' % index)
+        input_geometry(part, 'part_%d' % index, material).saveToFile(str(source_path))
+        sources.append(node(container, 'file', 'source_%d' % index, parms={'file': str(source_path)}))
+    if not full:
+        for i, (source, part) in enumerate(zip(sources, job['parts'])):
+            progress('reduce', i, len(sources))
+            result = export_geometry(reduce_part(container, source, job['percentage'], 'part_%d' % i), part['material'])
+            result['unit'] = part.get('unit', 0)
+            output['parts'].append(result)
+            output['outputTriangles'] += len(result['triangles']) // 3
+    else:
+        for ci, chunk in enumerate(job['chunks']):
+            checkpoint = folder / (chunk['id'] + '_checkpoint.json')
+            if checkpoint.exists():
+                cached = json.loads(checkpoint.read_text(encoding='utf-8'))
+                files = cached.get('files', [])
+                if cached.get('fingerprint') == fingerprint and files and all(Path(f['path']).is_file() and Path(f['path']).stat().st_size==f['size'] for f in files):
+                    output['chunks'].append(cached['chunk'])
+                    output['outputTriangles'] += cached['triangles']
+                    output['qualityWarnings'] += cached.get('qualityWarnings',0)
+                    progress('复用已完成块', ci+1, len(job['chunks']))
+                    continue
+            cluster = node(container, 'subnet', chunk['id'])
+            chunk_warnings = 0
+            chunk_result = {'id': chunk['id'], 'level': chunk['level'], 'parent': chunk['parent'], 'parts': [], 'surfaces': []}
+            indices = [i for i, p in enumerate(job['parts']) if p['unit'] in chunk['units']]
+            if not indices:
+                raise ValueError('Empty cluster %s' % chunk['id'])
+            buckets = {}
+            for index in indices:
+                cutout = bool(job['materials'][job['parts'][index]['material']]['cutout'])
+                buckets.setdefault(cutout, []).append(index)
+            work = [(bucket,members,'cutout' if bucket else 'opaque') for bucket,members in buckets.items()]
+            page_counts = {bucket:1 for bucket in buckets}
+            for bucket_index, (bucket, members, label) in enumerate(work):
+                def stage(name, step):
+                    progress(label + ' / ' + name, ci, len(job['chunks']), chunk['id'], bucket_index * 8 + step, len(work) * 8)
+                stage('构建减面节点', 0)
+                low_merge = node(cluster, 'merge', label + '_low')
+                high_merge = node(cluster, 'merge', label + '_high')
+                ao_merge = node(cluster, 'merge', label + '_ao')
+                emission_merge = node(cluster, 'merge', label + '_emission')
+                for slot, index in enumerate(members):
+                    material = job['materials'][job['parts'][index]['material']]
+                    source = node(cluster, 'object_merge', 'in_%d' % index, parms={'objpath1': sources[index].path()})
+                    reduced = reduce_part(cluster, source, max(1, job['percentage'] * (0.5 ** chunk['level'])), 'part_%d' % index)
+                    low_merge.setInput(slot, reduced)
+                    high = node(cluster, 'labs::quickmaterial', 'material_%d' % index, source,
+                                {'basecolor_texture': material['albedo'], 'baseBump_bumpTexture': material['normal'],
+                                 'rough_texture': material['roughness'], 'metallic_texture': material['metallic'],
+                                 'opaccolor_texture': material['opacity'], 'rough': 1, 'metallic': 1})
+                    high_merge.setInput(slot, high)
+                    for name, merge in (('occlusion', ao_merge), ('emission', emission_merge)):
+                        aux = node(cluster, 'labs::quickmaterial', name + '_%d' % index, source, {'basecolor_texture': material[name]})
+                        merge.setInput(slot, aux)
+                stage('计算减面', 1)
+                checked(low_merge)
+                stage('UV 独立进程启动', 2)
+                uv_prefix = folder / (chunk['id'] + '_' + label + '_uv')
+                uv_input = str(uv_prefix) + '_input.bgeo.sc'
+                checked(low_merge).saveToFile(uv_input)
+                config = {'input':uv_input, 'output':str(uv_prefix)+'_output.bgeo.sc',
+                          'flattened':str(uv_prefix)+'_flattened.bgeo.sc', 'report':str(uv_prefix)+'_report.json',
+                          'hip':str(uv_prefix)+'.hip', 'progress':str(folder/'progress.json'),
+                          'resolution':resolution, 'minimumResolution':minimum_resolution}
+                config_path = Path(str(uv_prefix)+'_config.json')
+                write_json(config_path, config)
+                Path(config['report']).unlink(missing_ok=True)
+                try:
+                    subprocess.run([sys.executable, '-u', str(worker), str(config_path)], check=True, timeout=uv_timeout)
+                except (subprocess.TimeoutExpired, subprocess.CalledProcessError) as error:
+                    if isinstance(error, subprocess.TimeoutExpired):
+                        cause = 'UV worker timed out after %ds' % uv_timeout
+                    else:
+                        cause = 'UV worker exited with code %d' % error.returncode
+                        if Path(config['report']).is_file():
+                            cause += ': ' + str(json.loads(Path(config['report']).read_text(encoding='utf-8')).get('error', 'see worker log'))
+                    if len(members)>1 and page_counts[bucket]<max_pages:
+                        groups=[[],[]];weights=[0,0]
+                        for member in sorted(members,key=lambda i:len(job['parts'][i]['triangles']),reverse=True):
+                            slot=weights.index(min(weights));groups[slot].append(member);weights[slot]+=len(job['parts'][member]['triangles'])
+                        work.extend((bucket,group,label+'_'+str(index)) for index,group in enumerate(groups))
+                        page_counts[bucket]+=1
+                        print('UV_RETRY: split %s/%s into two pages; %d/%d page budget, spacing and resolution unchanged. %s' % (chunk['id'],label,page_counts[bucket],max_pages,cause),flush=True)
+                        continue
+                    raise RuntimeError('%s in %s/%s; atlas pages %d/%d. No padding reduction or upscaling was applied. Inspect %s and %s; completed chunks are checkpointed.' % (cause,chunk['id'],label,page_counts[bucket],max_pages,config['hip'],config['report']))
+                report = json.loads(Path(config['report']).read_text(encoding='utf-8'))
+                if any(s['subpixelIslands']>0 for s in report['sizes'] if s['resolution']==minimum_resolution):
+                    chunk_warnings += 1
+                packed = node(cluster, 'file', label+'_uv_cache', parms={'file':config['output']})
+                low = node(cluster, 'divide', label + '_OUT', packed, {'convex': 1, 'usemaxsides': 1, 'numsides': 3})
+                low.setDisplayFlag(True)
+                checked(low)
+                prefix = folder / (chunk['id'] + '_' + label + '_')
+                stage('保存 Houdini 工程', 3)
+                hou.hipFile.save(str(folder / 'proxy.hip'))
+                stage('主 PBR 贴图烘焙', 4)
+                bake(cluster, low, high_merge, prefix, resolution)
+                stage('AO 贴图转烘焙', 5)
+                bake(cluster, low, ao_merge, prefix, resolution, False, 'occlusion', 'png', 1)
+                stage('自发光贴图烘焙', 6)
+                bake(cluster, low, emission_merge, prefix, resolution, False, 'emission', 'exr', 1)
+                stage('导出代理网格', 7)
+                result = export_geometry(low, len(chunk_result['surfaces']))
+                chunk_result['parts'].append(result)
+                chunk_result['surfaces'].append({'prefix': str(prefix).replace('\\', '/'), 'cutout': bucket})
+                output['outputTriangles'] += len(result['triangles']) // 3
+            output['chunks'].append(chunk_result)
+            output['qualityWarnings'] += chunk_warnings
+            artifacts = []
+            for surface in chunk_result['surfaces']:
+                for channel in ('diffuse.png','normal.png','opacity.png','roughness.png','metallic.png','occlusion.png','emission.exr'):
+                    path = Path(surface['prefix']+channel)
+                    artifacts.append({'path':str(path),'size':path.stat().st_size})
+            write_json(checkpoint, {'fingerprint':fingerprint,'chunk':chunk_result,'files':artifacts,
+                       'triangles':sum(len(p['triangles'])//3 for p in chunk_result['parts']), 'qualityWarnings':chunk_warnings})
+            progress('块完成', ci + 1, len(job['chunks']), chunk['id'], len(work)*8, len(work)*8)
+    progress('保存最终工程与结果', len(output['chunks']), len(job.get('chunks') or sources))
+    hou.hipFile.save(str(folder / 'proxy.hip'))
+    output['seconds'] = time.time() - started
+    write_json(folder / 'result.json', output)
+    progress('complete', len(job.get('chunks') or sources), len(job.get('chunks') or sources))
+    print(json.dumps({'status': 'complete', 'triangles': output['outputTriangles']}), flush=True)
+
+
+if __name__ == '__main__':
+    try:
+        build(sys.argv[1])
+    except Exception as error:
+        path = Path(sys.argv[1]).resolve().parent / 'progress.json'
+        state = json.loads(path.read_text()) if path.exists() else {}
+        state.update(state='failed', phase='failed: ' + str(error))
+        write_json(path, state)
+        raise

@@ -1,0 +1,10 @@
+/Jobs/
+/Tests/
+__pycache__/
+*.py[cod]
+*.log
+*.hip*
+*.bgeo*
+/build_proxy_before_*.py
+/build_proxy_v03_backup.py
+/uv_worker_before_*.py

@@ -1,0 +1,4 @@
+# Cache compatibility compares exact file bytes.
+*.py -text
+*.txt -text
+*.md text eol=lf
